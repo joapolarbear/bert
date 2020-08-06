@@ -51,11 +51,6 @@ flags.DEFINE_integer("num_train_steps", 100, "Number of training steps.")
 
 flags.DEFINE_integer("num_warmup_steps", 10000, "Number of warmup steps.")
 
-try:
-    import byteps.tensorflow as bps
-except:
-    import horovod.tensorflow as bps
-
 def model_fn_builder(bert_config, learning_rate,
                      num_train_steps, num_warmup_steps):
   """Returns `model_fn` closure for TPUEstimator."""
@@ -206,20 +201,6 @@ def input_fn_builder(input_files,
     """The actual input function."""
     batch_size = params["batch_size"]
 
-    def ret_tensor(a, b, dtype):
-        return tf.ones((1, a, b), dtype=dtype)
-    d = tf.data.Dataset.from_tensor_slices({
-        "masked_lm_positions": ret_tensor(batch_size, 20, tf.int32),
-        "input_mask": ret_tensor(batch_size, 128, tf.int32),
-        "masked_lm_weights": ret_tensor(batch_size, 20, tf.float32),
-        "segment_ids": ret_tensor(batch_size, 128, tf.int32),
-        "masked_lm_ids": ret_tensor(batch_size, 20, tf.int32),
-        "next_sentence_labels": ret_tensor(batch_size, 1, tf.int32),
-        "input_ids": ret_tensor(batch_size, 128, tf.int32)
-        })
-    d = d.repeat()
-    return d
-
     name_to_features = {
         "input_ids":
             tf.FixedLenFeature([max_seq_length], tf.int64),
@@ -317,7 +298,7 @@ class TimelineSession:
         self.feed_dict_meta = {}
         self.tensor_shape_ops = tensor_shape_ops
 
-        self.trace_dir = os.path.join(os.environ.get("BYTEPS_TRACE_DIR", "."), str(bps.local_rank()))
+        self.trace_dir = os.path.join(os.environ.get("BYTEPS_TRACE_DIR", "."), str(0))
         if not os.path.exists(self.trace_dir):
             os.makedirs(self.trace_dir)
         if os.environ.get("BYTEPS_TRACE_ON", "") != '1':
@@ -459,7 +440,6 @@ def train_input_generator(features):
 
 
 def main(_):
-  bps.init()
   tf.logging.set_verbosity(tf.logging.INFO)
 
   bert_config = modeling.BertConfig(256)
@@ -495,25 +475,19 @@ def main(_):
         # from rank 0 to all other processes. This is necessary to ensure consistent
         # initialization of all workers when training is started with random weights
         # or restored from a checkpoint.
-        bps.BroadcastGlobalVariablesHook(0),
 
         # Horovod: adjust number of steps based on number of GPUs.
-        tf.train.StopAtStepHook(last_step=205 // bps.size())
+        tf.train.StopAtStepHook(last_step=205),
   ]
-
-  try:
-      hooks.append(bps.TimelineHook(batch_size=FLAGS.train_batch_size))
-  except:
-      pass
 
   config = tf.ConfigProto()
   config.gpu_options.allow_growth = True
-  config.gpu_options.visible_device_list = str(bps.local_rank())
+  config.gpu_options.visible_device_list = str(0)
 
   training_batch_generator = train_input_generator(features)
 
   with tf.train.MonitoredTrainingSession(hooks=hooks, config=config) as mon_sess:
-    # mon_sess = TimelineSession(mon_sess, infer_shape_ops)
+    mon_sess = TimelineSession(mon_sess, infer_shape_ops)
     while not mon_sess.should_stop():
       # Run a training step synchronously.
       feed_dict = next(training_batch_generator)
