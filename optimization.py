@@ -21,8 +21,9 @@ from __future__ import print_function
 import re
 import tensorflow as tf
 
+import horovod.tensorflow as hvd
 
-def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
+def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu, amp=False):
   """Creates an optimizer training op."""
   global_step = tf.train.get_or_create_global_step()
 
@@ -67,15 +68,28 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
   if use_tpu:
     optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
 
-  tvars = tf.trainable_variables()
-  grads = tf.gradients(loss, tvars)
+  if amp:
+    optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(optimizer)
+  ### Horovod: wrap optimizer with DistributedOptimizer.
+  # optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(optimizer)
+  optimizer = hvd.DistributedOptimizer(optimizer, compression=hvd.Compression.none)
 
+  tvars = tf.trainable_variables()
+
+  ### single GPU version
+  # grads = tf.gradients(loss, tvars)
+
+  ### Utilize Horovod optimizer
+  grads_and_vars=optimizer.compute_gradients(loss, tvars)
+  grads = [grad for grad,var in grads_and_vars]
+  tvars = [var for grad,var in grads_and_vars]
+  
   # This is how the model was pre-trained.
   (grads, _) = tf.clip_by_global_norm(grads, clip_norm=1.0)
 
   train_op = optimizer.apply_gradients(
       zip(grads, tvars), global_step=global_step)
-
+      
   # Normally the global step update is done inside of `apply_gradients`.
   # However, `AdamWeightDecayOptimizer` doesn't do this. But if you use
   # a different optimizer, you should probably take this line out.

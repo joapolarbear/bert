@@ -23,6 +23,8 @@ import modeling
 import optimization
 import tensorflow as tf
 
+import horovod.tensorflow as hvd
+
 flags = tf.flags
 
 FLAGS = flags.FLAGS
@@ -80,6 +82,9 @@ flags.DEFINE_integer("iterations_per_loop", 1000,
 flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
+
+flags.DEFINE_bool("synthetic", False, "Use synthetic data.")
+flags.DEFINE_bool("amp", False, "Enable Auto Mixed Precision Traininng (AMP).")
 
 tf.flags.DEFINE_string(
     "tpu_name", None,
@@ -175,7 +180,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
       train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu, FLAGS.amp)
 
       output_spec = tf.contrib.tpu.TPUEstimatorSpec(
           mode=mode,
@@ -325,12 +330,27 @@ def input_fn_builder(input_files,
                      max_seq_length,
                      max_predictions_per_seq,
                      is_training,
-                     num_cpu_threads=4):
+                     num_cpu_threads=4,
+                     synthetic=False):
   """Creates an `input_fn` closure to be passed to TPUEstimator."""
 
   def input_fn(params):
     """The actual input function."""
     batch_size = params["batch_size"]
+    if synthetic:
+      def ret_tensor(a, b, dtype):
+        return tf.ones((1, a, b), dtype=dtype)
+      d = tf.data.Dataset.from_tensor_slices({
+        "masked_lm_positions": ret_tensor(batch_size, 20, tf.int32),
+        "input_mask": ret_tensor(batch_size, 128, tf.int32),
+        "masked_lm_weights": ret_tensor(batch_size, 20, tf.float32),
+        "segment_ids": ret_tensor(batch_size, 128, tf.int32),
+        "masked_lm_ids": ret_tensor(batch_size, 20, tf.int32),
+        "next_sentence_labels": ret_tensor(batch_size, 1, tf.int32),
+        "input_ids": ret_tensor(batch_size, 128, tf.int32)
+      })
+      d = d.repeat()
+      return d
 
     name_to_features = {
         "input_ids":
@@ -383,6 +403,12 @@ def input_fn_builder(input_files,
             batch_size=batch_size,
             num_parallel_batches=num_cpu_threads,
             drop_remainder=True))
+    # <DatasetV1Adapter shapes: 
+    # {
+    #   masked_lm_positions: (16, 20), input_mask: (16, 128), masked_lm_weights: (16, 20),
+    #   segment_ids: (16, 128), masked_lm_ids: (16, 20), next_sentence_labels: (16, 1), input_ids: (16, 128)},
+    # types: {masked_lm_positions: tf.int32, input_mask: tf.int32, masked_lm_weights: tf.float32,
+    #   segment_ids: tf.int32, masked_lm_ids: tf.int32, next_sentence_labels: tf.int32, input_ids: tf.int32}>
     return d
 
   return input_fn
@@ -390,6 +416,7 @@ def input_fn_builder(input_files,
 
 def _decode_record(record, name_to_features):
   """Decodes a record to a TensorFlow example."""
+  print(record)
   example = tf.parse_single_example(record, name_to_features)
 
   # tf.Example only supports tf.int64, but the TPU only supports tf.int32.
@@ -404,6 +431,8 @@ def _decode_record(record, name_to_features):
 
 
 def main(_):
+  hvd.init()
+  FLAGS.output_dir = FLAGS.output_dir if hvd.rank() == 0 else os.path.join(FLAGS.output_dir, str(hvd.rank()))
   tf.logging.set_verbosity(tf.logging.INFO)
 
   if not FLAGS.do_train and not FLAGS.do_eval:
@@ -427,11 +456,16 @@ def main(_):
         FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
 
   is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
+
+  config = tf.ConfigProto()
+  config.gpu_options.visible_device_list = str(hvd.local_rank())
+
   run_config = tf.contrib.tpu.RunConfig(
       cluster=tpu_cluster_resolver,
       master=FLAGS.master,
       model_dir=FLAGS.output_dir,
       save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+      session_config=config,
       tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
           num_shards=FLAGS.num_tpu_cores,
@@ -462,8 +496,11 @@ def main(_):
         input_files=input_files,
         max_seq_length=FLAGS.max_seq_length,
         max_predictions_per_seq=FLAGS.max_predictions_per_seq,
-        is_training=True)
-    estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps)
+        is_training=True,
+        synthetic=FLAGS.synthetic)
+    
+    hooks = [hvd.BroadcastGlobalVariablesHook(0), hvd.TimelineHook(batch_size=FLAGS.train_batch_size)]
+    estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps, hooks=hooks)
 
   if FLAGS.do_eval:
     tf.logging.info("***** Running evaluation *****")
