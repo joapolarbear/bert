@@ -22,29 +22,15 @@ import os
 import modeling
 import optimization
 import tensorflow as tf
+import numpy as np
+import timeit
+import time
+from google.protobuf.json_format import MessageToJson
+from google.protobuf.json_format import Parse as parse_protobuf_json
 
 flags = tf.flags
 
 FLAGS = flags.FLAGS
-
-## Required parameters
-flags.DEFINE_string(
-    "bert_config_file", None,
-    "The config json file corresponding to the pre-trained BERT model. "
-    "This specifies the model architecture.")
-
-flags.DEFINE_string(
-    "input_file", None,
-    "Input TF example files (can be a glob or comma separated).")
-
-flags.DEFINE_string(
-    "output_dir", None,
-    "The output directory where the model checkpoints will be written.")
-
-## Other parameters
-flags.DEFINE_string(
-    "init_checkpoint", None,
-    "Initial checkpoint (usually from a pre-trained BERT model).")
 
 flags.DEFINE_integer(
     "max_seq_length", 128,
@@ -57,58 +43,25 @@ flags.DEFINE_integer(
     "Maximum number of masked LM predictions per sequence. "
     "Must match data generation.")
 
-flags.DEFINE_bool("do_train", False, "Whether to run training.")
-
-flags.DEFINE_bool("do_eval", False, "Whether to run eval on the dev set.")
+flags.DEFINE_bool("do_train", True, "Whether to run training.")
 
 flags.DEFINE_integer("train_batch_size", 32, "Total batch size for training.")
 
-flags.DEFINE_integer("eval_batch_size", 8, "Total batch size for eval.")
-
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 
-flags.DEFINE_integer("num_train_steps", 100000, "Number of training steps.")
+flags.DEFINE_integer("num_train_steps", 100, "Number of training steps.")
 
 flags.DEFINE_integer("num_warmup_steps", 10000, "Number of warmup steps.")
 
-flags.DEFINE_integer("save_checkpoints_steps", 1000,
-                     "How often to save the model checkpoint.")
+try:
+    import byteps.tensorflow as bps
+    print("Use BytePS as the communication backend.")
+except:
+    import horovod.tensorflow as bps
+    print("Use Horovod as the communication backend.")
 
-flags.DEFINE_integer("iterations_per_loop", 1000,
-                     "How many steps to make in each estimator call.")
-
-flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
-
-flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
-
-tf.flags.DEFINE_string(
-    "tpu_name", None,
-    "The Cloud TPU to use for training. This should be either the name "
-    "used when creating the Cloud TPU, or a grpc://ip.address.of.tpu:8470 "
-    "url.")
-
-tf.flags.DEFINE_string(
-    "tpu_zone", None,
-    "[Optional] GCE zone where the Cloud TPU is located in. If not "
-    "specified, we will attempt to automatically detect the GCE project from "
-    "metadata.")
-
-tf.flags.DEFINE_string(
-    "gcp_project", None,
-    "[Optional] Project name for the Cloud TPU-enabled project. If not "
-    "specified, we will attempt to automatically detect the GCE project from "
-    "metadata.")
-
-tf.flags.DEFINE_string("master", None, "[Optional] TensorFlow master URL.")
-
-flags.DEFINE_integer(
-    "num_tpu_cores", 8,
-    "Only used if `use_tpu` is True. Total number of TPU cores to use.")
-
-
-def model_fn_builder(bert_config, init_checkpoint, learning_rate,
-                     num_train_steps, num_warmup_steps, use_tpu,
-                     use_one_hot_embeddings):
+def model_fn_builder(bert_config, learning_rate,
+                     num_train_steps, num_warmup_steps):
   """Returns `model_fn` closure for TPUEstimator."""
 
   def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
@@ -126,7 +79,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
     masked_lm_weights = features["masked_lm_weights"]
     next_sentence_labels = features["next_sentence_labels"]
 
-    is_training = (mode == tf.estimator.ModeKeys.TRAIN)
+    is_training = True
 
     model = modeling.BertModel(
         config=bert_config,
@@ -134,7 +87,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
         input_ids=input_ids,
         input_mask=input_mask,
         token_type_ids=segment_ids,
-        use_one_hot_embeddings=use_one_hot_embeddings)
+        use_one_hot_embeddings=False)
 
     (masked_lm_loss,
      masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
@@ -149,90 +102,15 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
     tvars = tf.trainable_variables()
 
-    initialized_variable_names = {}
-    scaffold_fn = None
-    if init_checkpoint:
-      (assignment_map, initialized_variable_names
-      ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
-      if use_tpu:
-
-        def tpu_scaffold():
-          tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-          return tf.train.Scaffold()
-
-        scaffold_fn = tpu_scaffold
-      else:
-        tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-
-    tf.logging.info("**** Trainable Variables ****")
-    for var in tvars:
-      init_string = ""
-      if var.name in initialized_variable_names:
-        init_string = ", *INIT_FROM_CKPT*"
-      tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
-                      init_string)
+    # tf.logging.info("**** Trainable Variables ****")
+    # for var in tvars:
+    #   tf.logging.info("  name = %s, shape = %s", var.name, var.shape)
 
     output_spec = None
-    if mode == tf.estimator.ModeKeys.TRAIN:
-      train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+    train_op = optimization.create_optimizer(
+        total_loss, learning_rate, num_train_steps, num_warmup_steps, False)
 
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode,
-          loss=total_loss,
-          train_op=train_op,
-          scaffold_fn=scaffold_fn)
-    elif mode == tf.estimator.ModeKeys.EVAL:
-
-      def metric_fn(masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
-                    masked_lm_weights, next_sentence_example_loss,
-                    next_sentence_log_probs, next_sentence_labels):
-        """Computes the loss and accuracy of the model."""
-        masked_lm_log_probs = tf.reshape(masked_lm_log_probs,
-                                         [-1, masked_lm_log_probs.shape[-1]])
-        masked_lm_predictions = tf.argmax(
-            masked_lm_log_probs, axis=-1, output_type=tf.int32)
-        masked_lm_example_loss = tf.reshape(masked_lm_example_loss, [-1])
-        masked_lm_ids = tf.reshape(masked_lm_ids, [-1])
-        masked_lm_weights = tf.reshape(masked_lm_weights, [-1])
-        masked_lm_accuracy = tf.metrics.accuracy(
-            labels=masked_lm_ids,
-            predictions=masked_lm_predictions,
-            weights=masked_lm_weights)
-        masked_lm_mean_loss = tf.metrics.mean(
-            values=masked_lm_example_loss, weights=masked_lm_weights)
-
-        next_sentence_log_probs = tf.reshape(
-            next_sentence_log_probs, [-1, next_sentence_log_probs.shape[-1]])
-        next_sentence_predictions = tf.argmax(
-            next_sentence_log_probs, axis=-1, output_type=tf.int32)
-        next_sentence_labels = tf.reshape(next_sentence_labels, [-1])
-        next_sentence_accuracy = tf.metrics.accuracy(
-            labels=next_sentence_labels, predictions=next_sentence_predictions)
-        next_sentence_mean_loss = tf.metrics.mean(
-            values=next_sentence_example_loss)
-
-        return {
-            "masked_lm_accuracy": masked_lm_accuracy,
-            "masked_lm_loss": masked_lm_mean_loss,
-            "next_sentence_accuracy": next_sentence_accuracy,
-            "next_sentence_loss": next_sentence_mean_loss,
-        }
-
-      eval_metrics = (metric_fn, [
-          masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
-          masked_lm_weights, next_sentence_example_loss,
-          next_sentence_log_probs, next_sentence_labels
-      ])
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode,
-          loss=total_loss,
-          eval_metrics=eval_metrics,
-          scaffold_fn=scaffold_fn)
-    else:
-      raise ValueError("Only TRAIN and EVAL modes are supported: %s" % (mode))
-
-    return output_spec
+    return train_op
 
   return model_fn
 
@@ -332,6 +210,20 @@ def input_fn_builder(input_files,
     """The actual input function."""
     batch_size = params["batch_size"]
 
+    def ret_tensor(a, b, dtype):
+        return tf.ones((1, a, b), dtype=dtype)
+    d = tf.data.Dataset.from_tensor_slices({
+        "masked_lm_positions": ret_tensor(batch_size, 20, tf.int32),
+        "input_mask": ret_tensor(batch_size, 128, tf.int32),
+        "masked_lm_weights": ret_tensor(batch_size, 20, tf.float32),
+        "segment_ids": ret_tensor(batch_size, 128, tf.int32),
+        "masked_lm_ids": ret_tensor(batch_size, 20, tf.int32),
+        "next_sentence_labels": ret_tensor(batch_size, 1, tf.int32),
+        "input_ids": ret_tensor(batch_size, 128, tf.int32)
+        })
+    d = d.repeat()
+    return d
+
     name_to_features = {
         "input_ids":
             tf.FixedLenFeature([max_seq_length], tf.int64),
@@ -402,92 +294,241 @@ def _decode_record(record, name_to_features):
 
   return example
 
+def add_infer_shape_ops(graph=None):
+    # add output_shape ops
+    if graph is None:
+        graph = tf.compat.v1.get_default_graph()
+    # collect tensor shapes
+    all_ops = graph.get_operations()
+    tensor_shape_ops = []
+    tensor_names = []
+    with graph.as_default():
+        for op in all_ops:
+            for output in op.outputs:
+                tensor_names.append(output.name)
+                name, idx = output.name.split(":")
+                tensor_shape_ops.append(tf.shape(output, name="final_shape/"+name+"_"+idx))
+    return (tensor_names, tensor_shape_ops)
+  
+from tensorflow.python.client import timeline
+import json
+import networkx as nx
+class TimelineSession:
+    def __init__(self, sess, tensor_shape_ops=None):
+        self.sess = sess
+        self.graph = sess.graph
+        self.step_cnt = 0
+        self.feed_dict_meta = {}
+        self.tensor_shape_ops = tensor_shape_ops
+
+        self.trace_dir = os.path.join(os.environ.get("BYTEPS_TRACE_DIR", "."), str(bps.local_rank()))
+        if not os.path.exists(self.trace_dir):
+            os.makedirs(self.trace_dir)
+        if os.environ.get("BYTEPS_TRACE_ON", "") != '1':
+            self._end_trace = True
+            return
+        self._end_trace = False
+        self.end_step = int(os.environ.get("BYTEPS_TRACE_END_STEP", "30"))
+        self.start_step = int(os.environ.get("BYTEPS_TRACE_START_STEP", "20"))
+
+        if not self._end_trace and self.start_step < 1:
+            raise ValueError("BYTEPS_TRACE_START_STEP must be larger than 1")
+        if not self._end_trace and self.end_step <= self.start_step:
+            raise ValueError("BYTEPS_TRACE_END_STEP must be larger than BYTEPS_TRACE_START_STEP")   
+
+        ### Timeline configuratoin
+        self.run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+        self.run_metadata = tf.RunMetadata()
+        self.traces = {"traceEvents":[]}
+
+        self.dag = None
+
+    def run(self, *args_, **kwargs_):
+        if self._end_trace:
+            ret = self.sess.run(*args_, **kwargs_)
+        elif not self._end_trace and self.step_cnt < self.start_step:
+            ret = self.sess.run(*args_, **kwargs_)
+            self.step_cnt += 1
+        elif not self._end_trace and self.step_cnt < self.end_step:
+            ret = self.sess.run(*args_, options=self.run_options, run_metadata=self.run_metadata, **kwargs_)
+            # Create the Timeline object, and write it to a json
+            tl = timeline.Timeline(self.run_metadata.step_stats)
+            ctf = json.loads(tl.generate_chrome_trace_format())
+            self.traces["traceEvents"] += ctf["traceEvents"]
+            print("Add the {}th step of traces".format(self.step_cnt))
+            self.step_cnt += 1
+
+            ### Create the DAG
+            if self.dag is None:
+                self.dag = nx.DiGraph()
+                for trace in ctf["traceEvents"]:
+                    if trace["ph"] == "M" or "args" not in trace:
+                        continue
+                    op = trace["args"]["op"]
+                    name = trace["args"]["name"]
+
+                    ### Add nodes to the DAG
+                    if name not in self.dag.nodes:
+                        self.dag.add_node(name)
+
+                    ### Add dependency info
+                    for k, v in trace["args"].items():
+                        if "input" in k:
+                            self.dag.add_edge(v, name)
+
+            try:
+                not_found = False
+                nx.find_cycle(self.dag.cycle)
+            except:
+                not_found = True
+            assert not_found
+
+            def flatten_fetch_list(fetch_list):
+                if not isinstance(fetch_list, (list, tuple)):
+                    return [fetch_list]
+                else:
+                    result_list = []
+                    for op in fetch_list:
+                        result_list += flatten_fetch_list(op)
+                    return result_list
+
+            ### Output traces
+            if self.step_cnt == self.end_step:
+                fd = kwargs_.get("feed_dict")
+                tensor_names, tensor_shape_ops = self.tensor_shape_ops
+                out_shapes = self.sess.run(tensor_shape_ops, feed_dict=fd)
+                self.tensor_shapes = {}
+                for name, shape in zip(tensor_names, out_shapes):
+                    self.tensor_shapes[name] = [int(s) for s in list(shape)]
+                # collect feed dict meta
+                self.fetches = [tensor.name for tensor in flatten_fetch_list(args_[0])]
+                for key, tensor in fd.items():
+                    shape_as_list = [int(dim) for dim in tensor.shape]
+                    dtype_as_str = (str(tensor.dtype).split("\'")[1] if "\'" in str(tensor.dtype) else str(tensor.dtype)).split("_ref")[0]
+                    self.feed_dict_meta[key.op.name] = {"shape": shape_as_list, 
+                                                    "dtype": dtype_as_str}
+                self._end_trace = True
+                self.output_traces()
+
+        ### Return all fetches
+        return ret
+    
+    def output_traces(self):
+        # https://stackoverflow.com/questions/57557564/tensorflow-reload-mode-to-session-from-graph-def
+        var_ops = [op for op in self.sess.graph.get_operations() if op.type == 'VariableV2']
+        # Get the values
+        var_shapes = {}
+        for v in var_ops:
+            try:
+                shape_as_list = [int(dim) for dim in v.outputs[0].shape]
+                dtype_as_str = (str(v.outputs[0].dtype).split("\'")[1] if "\'" in str(v.outputs[0].dtype) else str(v.outputs[0].dtype)).split("_ref")[0]
+                var_shapes[v.name] = {"shape": shape_as_list, "dtype": str(v.outputs[0].dtype).split("\'")[1].split("_ref")[0]}
+            except tf.errors.FailedPreconditionError:
+                # Uninitialized variables are ignored
+                pass
+        with open(os.path.join(self.trace_dir, "variables_meta.json"), "w") as f:
+            json.dump(var_shapes, f, indent=4)
+
+        with open(os.path.join(self.trace_dir, "temp.json"), "w") as f:
+            json.dump(self.traces, f, indent=4)
+        
+        with open(os.path.join(self.trace_dir, "tensor_shapes.json"), "w") as f:
+            json.dump(self.tensor_shapes, f, indent=4)
+        
+        with open(os.path.join(self.trace_dir, "run_meta.json"), "w") as f:
+            json.dump({"fetches":self.fetches, "feed_dict": self.feed_dict_meta}, f, indent=4)
+
+        ## collect graph info
+        graphdef = tf.get_default_graph().as_graph_def(add_shapes=True)
+        graph_str = json.loads(MessageToJson(graphdef))
+        with open(os.path.join(self.trace_dir, "final_graph.json"), "w") as f:
+            json.dump(graph_str, f, indent=4)
+
+        nx.write_gml(self.dag, os.path.join(self.trace_dir, "dag.gml"), lambda x: str(x))
+        print("Stop tracing, output trace: %s" % self.trace_dir)
+
+    def should_stop(self):
+        return self.sess.should_stop()
+
+def train_input_generator(features):
+  while True:
+    feed_dict = {}
+    for input_name, tensor in features.items():
+      if "\'" in str(tensor.dtype):
+        dtype_as_str = str(tensor.dtype).split("\'")[1]
+      else:
+        dtype_as_str = str(tensor.dtype)
+      feed_dict[tensor] = np.ones(shape=tensor.shape).astype(dtype_as_str)
+    yield feed_dict
+
 
 def main(_):
+  bps.init()
   tf.logging.set_verbosity(tf.logging.INFO)
 
-  if not FLAGS.do_train and not FLAGS.do_eval:
-    raise ValueError("At least one of `do_train` or `do_eval` must be True.")
-
-  bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
-
-  tf.gfile.MakeDirs(FLAGS.output_dir)
-
-  input_files = []
-  for input_pattern in FLAGS.input_file.split(","):
-    input_files.extend(tf.gfile.Glob(input_pattern))
-
-  tf.logging.info("*** Input Files ***")
-  for input_file in input_files:
-    tf.logging.info("  %s" % input_file)
-
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
-
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
-      model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+  bert_config = modeling.BertConfig(256)
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
-      init_checkpoint=FLAGS.init_checkpoint,
       learning_rate=FLAGS.learning_rate,
       num_train_steps=FLAGS.num_train_steps,
-      num_warmup_steps=FLAGS.num_warmup_steps,
-      use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu)
+      num_warmup_steps=FLAGS.num_warmup_steps)
 
-  # If TPU is not available, this will fall back to normal Estimator on CPU
-  # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
-      model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      eval_batch_size=FLAGS.eval_batch_size)
+  max_seq_length = FLAGS.max_seq_length
+  max_predictions_per_seq = FLAGS.max_predictions_per_seq
+  
+  with tf.name_scope("input"):
+    input_ids = tf.placeholder(shape=[FLAGS.train_batch_size, max_seq_length], dtype=tf.int32)
+    input_mask = tf.placeholder(shape=[FLAGS.train_batch_size, max_seq_length], dtype=tf.int32)
+    segment_ids = tf.placeholder(shape=[FLAGS.train_batch_size, max_seq_length], dtype=tf.int32)
+    masked_lm_positions = tf.placeholder(shape=[FLAGS.train_batch_size, max_predictions_per_seq], dtype=tf.int32)
+    masked_lm_ids = tf.placeholder(shape=[FLAGS.train_batch_size, max_predictions_per_seq], dtype=tf.int32)
+    masked_lm_weights = tf.placeholder(shape=[FLAGS.train_batch_size, max_predictions_per_seq], dtype=tf.float32)
+    next_sentence_labels = tf.placeholder(shape=[FLAGS.train_batch_size, 1], dtype=tf.int32)
 
-  if FLAGS.do_train:
-    tf.logging.info("***** Running training *****")
-    tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
-    train_input_fn = input_fn_builder(
-        input_files=input_files,
-        max_seq_length=FLAGS.max_seq_length,
-        max_predictions_per_seq=FLAGS.max_predictions_per_seq,
-        is_training=True)
-    estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps)
+  features = {"input_ids": input_ids, "input_mask": input_mask, "segment_ids": segment_ids,
+            "masked_lm_positions": masked_lm_positions, "masked_lm_ids": masked_lm_ids,
+            "masked_lm_weights": masked_lm_weights, "next_sentence_labels": next_sentence_labels}
+  
+  train_op = model_fn(features, None, None, None)
 
-  if FLAGS.do_eval:
-    tf.logging.info("***** Running evaluation *****")
-    tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
+  infer_shape_ops = add_infer_shape_ops()
 
-    eval_input_fn = input_fn_builder(
-        input_files=input_files,
-        max_seq_length=FLAGS.max_seq_length,
-        max_predictions_per_seq=FLAGS.max_predictions_per_seq,
-        is_training=False)
+  hooks = [
+        # Horovod: BroadcastGlobalVariablesHook broadcasts initial variable states
+        # from rank 0 to all other processes. This is necessary to ensure consistent
+        # initialization of all workers when training is started with random weights
+        # or restored from a checkpoint.
+        bps.BroadcastGlobalVariablesHook(0),
 
-    result = estimator.evaluate(
-        input_fn=eval_input_fn, steps=FLAGS.max_eval_steps)
+        # Horovod: adjust number of steps based on number of GPUs.
+        # tf.train.StopAtStepHook(last_step=100)
+  ]
 
-    output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
-    with tf.gfile.GFile(output_eval_file, "w") as writer:
-      tf.logging.info("***** Eval results *****")
-      for key in sorted(result.keys()):
-        tf.logging.info("  %s = %s", key, str(result[key]))
-        writer.write("%s = %s\n" % (key, str(result[key])))
+  try:
+      hooks.append(bps.TimelineHook(batch_size=FLAGS.train_batch_size))
+  except:
+      pass
 
+  config = tf.ConfigProto()
+  config.gpu_options.allow_growth = True
+  config.gpu_options.visible_device_list = str(bps.local_rank())
+
+  training_batch_generator = train_input_generator(features)
+  num_batches_per_iter = 10
+  num_iteration = 12
+  with tf.train.MonitoredTrainingSession(hooks=hooks, config=config) as mon_sess:
+    # mon_sess = TimelineSession(mon_sess, infer_shape_ops)
+    def benchmark_step():
+        feed_dict = next(training_batch_generator)
+        mon_sess.run([train_op], feed_dict=feed_dict)
+    for x in range(num_iteration):
+      # Run a training step synchronously.
+      time_s = time.time()
+      dur = timeit.timeit(benchmark_step, number=num_batches_per_iter)
+      iter_time = (time.time() - time_s) / num_batches_per_iter
+      if bps.rank() == 0:
+        print('Iter #%d: iteration time %f ms' % (x, iter_time * 1000))
 
 if __name__ == "__main__":
-  flags.mark_flag_as_required("input_file")
-  flags.mark_flag_as_required("bert_config_file")
-  flags.mark_flag_as_required("output_dir")
   tf.app.run()

@@ -19,7 +19,24 @@ from __future__ import division
 from __future__ import print_function
 
 import re
+import os
+import json
 import tensorflow as tf
+try:
+  import byteps.tensorflow as bps
+except:
+  import horovod.tensorflow as bps
+
+from google.protobuf.json_format import MessageToJson
+from google.protobuf.json_format import Parse as parse_protobuf_json
+
+def dump_computation_graph(trace_dir):
+    graphdef = tf.compat.v1.get_default_graph().as_graph_def()
+    graph_str = json.loads(MessageToJson(graphdef))
+    if not os.path.isdir(trace_dir):
+      os.makedirs(trace_dir)
+    with open(os.path.join(trace_dir, "graph.json"), "w") as f:
+        json.dump(graph_str, f, indent=4)
 
 
 def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
@@ -63,15 +80,19 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
       beta_2=0.999,
       epsilon=1e-6,
       exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
-
-  if use_tpu:
-    optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
-
+    
+  print("=================USING DISTRIBUTED OPTIMIZER=================")
+  optimizer = bps.DistributedOptimizer(optimizer)
   tvars = tf.trainable_variables()
-  grads = tf.gradients(loss, tvars)
+  grads_and_vars=optimizer.compute_gradients(loss, tvars)
+  grads = [grad for grad,var in grads_and_vars]
+  tvars = [var for grad,var in grads_and_vars]
 
   # This is how the model was pre-trained.
   (grads, _) = tf.clip_by_global_norm(grads, clip_norm=1.0)
+
+  trace_dir = os.path.join(os.environ.get("BYTEPS_TRACE_DIR", "."), str(bps.local_rank()))
+  dump_computation_graph(trace_dir)
 
   train_op = optimizer.apply_gradients(
       zip(grads, tvars), global_step=global_step)
