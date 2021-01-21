@@ -20,7 +20,7 @@ from __future__ import print_function
 
 import os
 import modeling
-import optimization
+import optimization_single_machine as optimization
 import tensorflow as tf
 import numpy as np
 import timeit
@@ -54,13 +54,6 @@ flags.DEFINE_integer("num_train_steps", 100, "Number of training steps.")
 flags.DEFINE_integer("num_warmup_steps", 10000, "Number of warmup steps.")
 
 flags.DEFINE_string("model", "BERT_BASE", "Model.")
-
-try:
-    import byteps.tensorflow as bps
-    print("Use BytePS as the communication backend.")
-except:
-    import horovod.tensorflow as bps
-    print("Use Horovod as the communication backend.")
 
 def model_fn_builder(bert_config, learning_rate,
                      num_train_steps, num_warmup_steps):
@@ -325,7 +318,6 @@ def train_input_generator(features):
 
 
 def main(_):
-  bps.init()
   tf.logging.set_verbosity(tf.logging.INFO)
 
   if FLAGS.model.lower() == "bert_base":
@@ -368,25 +360,11 @@ def main(_):
 
   infer_shape_ops = add_infer_shape_ops()
 
-  hooks = [
-        # Horovod: BroadcastGlobalVariablesHook broadcasts initial variable states
-        # from rank 0 to all other processes. This is necessary to ensure consistent
-        # initialization of all workers when training is started with random weights
-        # or restored from a checkpoint.
-        bps.BroadcastGlobalVariablesHook(0),
-
-        # Horovod: adjust number of steps based on number of GPUs.
-        # tf.train.StopAtStepHook(last_step=100)
-  ]
-
-  try:
-      hooks.append(bps.TimelineHook(batch_size=FLAGS.train_batch_size))
-  except:
-      pass
+  hooks = []
 
   config = tf.ConfigProto()
   config.gpu_options.allow_growth = True
-  config.gpu_options.visible_device_list = str(bps.local_rank())
+  config.gpu_options.visible_device_list = str(0)
 
   training_batch_generator = train_input_generator(features)
   num_batches_per_iter = 10
@@ -401,10 +379,9 @@ def main(_):
       time_s = time.time()
       dur = timeit.timeit(benchmark_step, number=num_batches_per_iter)
       iter_time = (time.time() - time_s) / num_batches_per_iter
-      if bps.rank() == 0:
-        print('Iter #%d: iteration time %f ms' % (x, iter_time * 1000))
+      print('Iter #%d: iteration time %f ms' % (x, iter_time * 1000))
     if os.environ.get("BPF_TEST_MEMORY", "") == "1":
-        print("Rank %d: Peak memory: %.2f MB" % (bps.rank(), mon_sess.run(memory_summary) / (1024**2)))
+        print("Rank %d: Peak memory: %.2f MB" % (0, mon_sess.run(memory_summary) / (1024**2)))
 
 if __name__ == "__main__":
   tf.app.run()

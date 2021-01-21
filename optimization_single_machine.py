@@ -22,19 +22,15 @@ import re
 import os
 import json
 import tensorflow as tf
-try:
-  import byteps.tensorflow as bps
-except:
-  import horovod.tensorflow as bps
 
 from google.protobuf.json_format import MessageToJson
 from google.protobuf.json_format import Parse as parse_protobuf_json
 
 if os.environ.get("BPF_ENABLE_RECOMPUTE", "") == '1':
     from horovod.tensorflow import memory_saving_gradients # monkey patch tf.gradients to point to our custom version, with automatic checkpoint selection
-    # tf.__dict__["gradients"] = memory_saving_gradients.gradients_speed
-    tf.__dict__["gradients"] = memory_saving_gradients.gradients_memory
-    print("================= Enable Re-computation =================")
+    tf.__dict__["gradients"] = memory_saving_gradients.gradients_speed
+    tf.python.ops.__dict__["gradients"] = memory_saving_gradients.gradients_speed
+    print("Enable Re-computation")
 
 def dump_computation_graph(trace_dir):
     graphdef = tf.compat.v1.get_default_graph().as_graph_def()
@@ -86,24 +82,16 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
       beta_2=0.999,
       epsilon=1e-6,
       exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
-    
-  print("=================USING DISTRIBUTED OPTIMIZER=================")
-  optimizer = bps.DistributedOptimizer(optimizer)
   tvars = tf.trainable_variables()
-  if os.environ.get("BPF_ENABLE_RECOMPUTE", "") == '1':
-    grads = tf.gradients(loss, tvars)
-    tvars = tf.trainable_variables()
-    # print("HHP tf.gradients: {} vars, {}".format(len(tvars), tvars))
-  else:
-    grads_and_vars = optimizer.compute_gradients(loss, tvars)
-    grads = [grad for grad,var in grads_and_vars]
-    tvars = [var for grad,var in grads_and_vars]
-    # print("HHP optimizer.compute_gradients: {} vars, {}".format(len(tvars), tvars))
+  grads_and_vars=optimizer.compute_gradients(loss, tvars)
+  # grads_and_vars=tf.gradients(loss, tvars)
+  grads = [grad for grad,var in grads_and_vars]
+  tvars = [var for grad,var in grads_and_vars]
 
   # This is how the model was pre-trained.
   (grads, _) = tf.clip_by_global_norm(grads, clip_norm=1.0)
 
-  trace_dir = os.path.join(os.environ.get("BYTEPS_TRACE_DIR", "."), str(bps.local_rank()))
+  trace_dir = os.path.join(os.environ.get("BYTEPS_TRACE_DIR", "."), str(0))
   dump_computation_graph(trace_dir)
 
   train_op = optimizer.apply_gradients(
