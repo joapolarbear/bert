@@ -87,6 +87,9 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
       epsilon=1e-6,
       exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
     
+  if args.amp:
+    # auto mixed precision training
+    optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(optimizer)
   print("=================USING DISTRIBUTED OPTIMIZER=================")
   optimizer = bps.DistributedOptimizer(optimizer)
   tvars = tf.trainable_variables()
