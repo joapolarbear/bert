@@ -45,7 +45,7 @@ def dump_computation_graph(trace_dir):
         json.dump(graph_str, f, indent=4)
 
 
-def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
+def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu, use_amp=False):
   """Creates an optimizer training op."""
   global_step = tf.train.get_or_create_global_step()
 
@@ -87,7 +87,7 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
       epsilon=1e-6,
       exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
     
-  if args.amp:
+  if use_amp:
     # auto mixed precision training
     optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(optimizer)
   print("=================USING DISTRIBUTED OPTIMIZER=================")

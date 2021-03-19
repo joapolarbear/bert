@@ -55,6 +55,8 @@ flags.DEFINE_integer("num_warmup_steps", 10000, "Number of warmup steps.")
 
 flags.DEFINE_string("model", "BERT_BASE", "Model.")
 
+flags.DEFINE_bool("amp", False, "Whether to use AMP.")
+
 try:
     import byteps.tensorflow as bps
     print("Use BytePS as the communication backend.")
@@ -110,7 +112,7 @@ def model_fn_builder(bert_config, learning_rate,
 
     output_spec = None
     train_op = optimization.create_optimizer(
-        total_loss, learning_rate, num_train_steps, num_warmup_steps, False)
+        total_loss, learning_rate, num_train_steps, num_warmup_steps, False, FLAGS.amp)
 
     return train_op
 
