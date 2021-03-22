@@ -392,7 +392,7 @@ def main(_):
 
   training_batch_generator = train_input_generator(features)
   num_batches_per_iter = 10
-  num_iteration = 12
+  num_iteration = 20
   with tf.train.MonitoredTrainingSession(hooks=hooks, config=config) as mon_sess:
     # mon_sess = TimelineSession(mon_sess, infer_shape_ops)
     def benchmark_step():
