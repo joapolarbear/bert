@@ -27,6 +27,22 @@ import numpy as np
 import six
 import tensorflow as tf
 
+try:
+  tf_app = tf.app
+  flags = tf.flags
+  tf_gfile = tf.gfile
+  tf_variable_scope = tf.variable_scope
+  tf_get_variable = tf.get_variable
+  tf_truncated_normal_initializer = tf.truncated_normal_initializer
+  tf_logging = tf.logging
+except AttributeError:
+  tf_app = tf.compat.v1.app
+  flags = tf.compat.v1.flags
+  tf_gfile = tf.compat.v1.gfile
+  tf_variable_scope = tf.compat.v1.variable_scope
+  tf_get_variable = tf.compat.v1.get_variable
+  tf_truncated_normal_initializer = tf.compat.v1.truncated_normal_initializer
+  tf_logging = tf.compat.v1.logging
 
 class BertConfig(object):
   """Configuration for `BertModel`."""
@@ -90,7 +106,7 @@ class BertConfig(object):
   @classmethod
   def from_json_file(cls, json_file):
     """Constructs a `BertConfig` from a json file of parameters."""
-    with tf.gfile.GFile(json_file, "r") as reader:
+    with tf_gfile.GFile(json_file, "r") as reader:
       text = reader.read()
     return cls.from_dict(json.loads(text))
 
@@ -168,68 +184,103 @@ class BertModel(object):
     if token_type_ids is None:
       token_type_ids = tf.zeros(shape=[batch_size, seq_length], dtype=tf.int32)
 
-    with tf.variable_scope(scope, default_name="bert"):
-      with tf.variable_scope("embeddings"):
-        # Perform embedding lookup on the word ids.
-        (self.embedding_output, self.embedding_table) = embedding_lookup(
-            input_ids=input_ids,
-            vocab_size=config.vocab_size,
-            embedding_size=config.hidden_size,
-            initializer_range=config.initializer_range,
-            word_embedding_name="word_embeddings",
-            use_one_hot_embeddings=use_one_hot_embeddings)
+    # Perform embedding lookup on the word ids.
+    self._embedding_layer = OnDeviceEmbedding(
+        vocab_size=config.vocab_size,
+        embedding_width=config.hidden_size,
+        # initializer=initializer,
+        name='word_embeddings')
+    word_embeddings = self._embedding_layer(input_ids)
 
-        # Add positional embeddings and token type embeddings, then layer
-        # normalize and perform dropout.
-        self.embedding_output = embedding_postprocessor(
-            input_tensor=self.embedding_output,
-            use_token_type=True,
-            token_type_ids=token_type_ids,
-            token_type_vocab_size=config.type_vocab_size,
-            token_type_embedding_name="token_type_embeddings",
-            use_position_embeddings=True,
-            position_embedding_name="position_embeddings",
-            initializer_range=config.initializer_range,
-            max_position_embeddings=config.max_position_embeddings,
-            dropout_prob=config.hidden_dropout_prob)
+    # Add positional embeddings and token type embeddings, then layer
+    # normalize and perform dropout.
+    type_embeddings = (OnDeviceEmbedding(
+          vocab_size=config.vocab_size,
+          embedding_width=config.hidden_size,
+          use_one_hot=True,
+          # initializer=initializer,
+          name='type_embeddings')(token_type_ids))
+    
+    # Always uses dynamic slicing for simplicity.
+    self._position_embedding_layer = PositionEmbedding(
+        # initializer=initializer,
+        use_dynamic_slicing=True,
+        max_sequence_length=config.max_position_embeddings)
+    position_embeddings = self._position_embedding_layer(word_embeddings)
+    
+    embeddings = tf.keras.layers.Add()([word_embeddings, position_embeddings, type_embeddings])
+    embeddings = (
+        tf.keras.layers.LayerNormalization(
+            name='embeddings/layer_norm',
+            axis=-1,
+            # epsilon=util.LAYER_NORM_EPSILON,
+            dtype=tf.float32)(embeddings))
+    self.embedding_output = (
+        tf.keras.layers.Dropout(rate=config.hidden_dropout_prob)(embeddings))
 
-      with tf.variable_scope("encoder"):
-        # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
-        # mask of shape [batch_size, seq_length, seq_length] which is used
-        # for the attention scores.
-        attention_mask = create_attention_mask_from_input_mask(
-            input_ids, input_mask)
+    '''
 
-        # Run the stacked transformer.
-        # `sequence_output` shape = [batch_size, seq_length, hidden_size].
-        self.all_encoder_layers = transformer_model(
-            input_tensor=self.embedding_output,
-            attention_mask=attention_mask,
-            hidden_size=config.hidden_size,
-            num_hidden_layers=config.num_hidden_layers,
-            num_attention_heads=config.num_attention_heads,
-            intermediate_size=config.intermediate_size,
-            intermediate_act_fn=get_activation(config.hidden_act),
-            hidden_dropout_prob=config.hidden_dropout_prob,
-            attention_probs_dropout_prob=config.attention_probs_dropout_prob,
-            initializer_range=config.initializer_range,
-            do_return_all_layers=True)
+    # Perform embedding lookup on the word ids.
+    (self.embedding_output, self.embedding_table) = EmbeddingLayer(
+        vocab_size=config.vocab_size,
+        embedding_size=config.hidden_size,
+        initializer_range=config.initializer_range,
+        word_embedding_name="word_embeddings",
+        use_one_hot_embeddings=use_one_hot_embeddings)(input_ids)
 
-      self.sequence_output = self.all_encoder_layers[-1]
-      # The "pooler" converts the encoded sequence tensor of shape
-      # [batch_size, seq_length, hidden_size] to a tensor of shape
-      # [batch_size, hidden_size]. This is necessary for segment-level
-      # (or segment-pair-level) classification tasks where we need a fixed
-      # dimensional representation of the segment.
-      with tf.variable_scope("pooler"):
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token. We assume that this has been pre-trained
-        first_token_tensor = tf.squeeze(self.sequence_output[:, 0:1, :], axis=1)
-        self.pooled_output = tf.layers.dense(
-            first_token_tensor,
-            config.hidden_size,
-            activation=tf.tanh,
-            kernel_initializer=create_initializer(config.initializer_range))
+    # Add positional embeddings and token type embeddings, then layer
+    # normalize and perform dropout.
+    
+    token_type_embeddings, position_embeddings = EmbeddingPostprocessor(
+        use_token_type=True,
+        token_type_ids=token_type_ids,
+        token_type_vocab_size=config.type_vocab_size,
+        token_type_embedding_name="token_type_embeddings",
+        use_position_embeddings=True,
+        position_embedding_name="position_embeddings",
+        initializer_range=config.initializer_range,
+        max_position_embeddings=config.max_position_embeddings,
+        dropout_prob=config.hidden_dropout_prob)(self.embedding_output)
+
+    self.embedding_output = layer_norm_and_dropout(self.embedding_output , config.hidden_dropout_prob)
+        '''
+
+    with tf_variable_scope("encoder"):
+      # This converts a 2D mask of shape [batch_size, seq_length] to a 3D
+      # mask of shape [batch_size, seq_length, seq_length] which is used
+      # for the attention scores.
+      attention_mask = create_attention_mask_from_input_mask(
+          input_ids, input_mask)
+
+      # Run the stacked transformer.
+      # `sequence_output` shape = [batch_size, seq_length, hidden_size].
+      self.all_encoder_layers = transformer_model(
+          input_tensor=self.embedding_output,
+          attention_mask=attention_mask,
+          hidden_size=config.hidden_size,
+          num_hidden_layers=config.num_hidden_layers,
+          num_attention_heads=config.num_attention_heads,
+          intermediate_size=config.intermediate_size,
+          intermediate_act_fn=get_activation(config.hidden_act),
+          hidden_dropout_prob=config.hidden_dropout_prob,
+          attention_probs_dropout_prob=config.attention_probs_dropout_prob,
+          initializer_range=config.initializer_range,
+          do_return_all_layers=True)
+
+    self.sequence_output = self.all_encoder_layers[-1]
+    # The "pooler" converts the encoded sequence tensor of shape
+    # [batch_size, seq_length, hidden_size] to a tensor of shape
+    # [batch_size, hidden_size]. This is necessary for segment-level
+    # (or segment-pair-level) classification tasks where we need a fixed
+    # dimensional representation of the segment.
+    with tf_variable_scope("pooler"):
+      # We "pool" the model by simply taking the hidden state corresponding
+      # to the first token. We assume that this has been pre-trained
+      first_token_tensor = tf.squeeze(self.sequence_output[:, 0:1, :], axis=1)
+      self.pooled_output = tf.keras.layers.Dense(
+          units=config.hidden_size,
+          activation=tf.tanh,
+          kernel_initializer=create_initializer(config.initializer_range))(first_token_tensor)
 
   def get_pooled_output(self):
     return self.pooled_output
@@ -258,8 +309,7 @@ class BertModel(object):
     return self.embedding_output
 
   def get_embedding_table(self):
-    return self.embedding_table
-
+    return self._embedding_layer.embeddings
 
 def gelu(x):
   """Gaussian Error Linear Unit.
@@ -341,7 +391,7 @@ def get_assignment_map_from_checkpoint(tvars, init_checkpoint):
   return (assignment_map, initialized_variable_names)
 
 
-def dropout(input_tensor, dropout_prob):
+def dropout(input_tensor, dropout_prob, name=None):
   """Perform dropout.
 
   Args:
@@ -355,144 +405,384 @@ def dropout(input_tensor, dropout_prob):
   if dropout_prob is None or dropout_prob == 0.0:
     return input_tensor
 
-  output = tf.nn.dropout(input_tensor, 1.0 - dropout_prob)
+  output = tf.keras.layers.Dropout(1.0 - dropout_prob, name=name)(input_tensor)
   return output
 
 
 def layer_norm(input_tensor, name=None):
   """Run layer normalization on the last dimension of the tensor."""
-  return tf.contrib.layers.layer_norm(
-      inputs=input_tensor, begin_norm_axis=-1, begin_params_axis=-1, scope=name)
-
+  return tf.keras.layers.LayerNormalization(name=name, axis=-1)(input_tensor)
 
 def layer_norm_and_dropout(input_tensor, dropout_prob, name=None):
   """Runs layer normalization followed by dropout."""
   output_tensor = layer_norm(input_tensor, name)
-  output_tensor = dropout(output_tensor, dropout_prob)
+  output_tensor = dropout(output_tensor, dropout_prob, name=name)
   return output_tensor
 
 
 def create_initializer(initializer_range=0.02):
   """Creates a `truncated_normal_initializer` with the given range."""
-  return tf.truncated_normal_initializer(stddev=initializer_range)
+  # return tf_truncated_normal_initializer(stddev=initializer_range)
+  return tf.keras.initializers.TruncatedNormal(stddev=initializer_range)
 
+@tf.keras.utils.register_keras_serializable(package="Text")
+class OnDeviceEmbedding(tf.keras.layers.Layer):
+  """Performs an embedding lookup suitable for accelerator devices.
 
-def embedding_lookup(input_ids,
-                     vocab_size,
-                     embedding_size=128,
-                     initializer_range=0.02,
-                     word_embedding_name="word_embeddings",
-                     use_one_hot_embeddings=False):
-  """Looks up words embeddings for id tensor.
+  This layer uses either tf.gather or tf.one_hot to translate integer indices to
+  float embeddings.
 
-  Args:
-    input_ids: int32 Tensor of shape [batch_size, seq_length] containing word
-      ids.
-    vocab_size: int. Size of the embedding vocabulary.
-    embedding_size: int. Width of the word embeddings.
-    initializer_range: float. Embedding initialization range.
-    word_embedding_name: string. Name of the embedding table.
-    use_one_hot_embeddings: bool. If True, use one-hot method for word
-      embeddings. If False, use `tf.gather()`.
-
-  Returns:
-    float Tensor of shape [batch_size, seq_length, embedding_size].
+  Attributes:
+    vocab_size: Number of elements in the vocabulary.
+    embedding_width: Output size of the embedding layer.
+    initializer: The initializer to use for the embedding weights. Defaults to
+      "glorot_uniform".
+    use_one_hot: Whether to use tf.one_hot over tf.gather for the embedding
+      lookup. Defaults to False (that is, using tf.gather). Setting this option
+      to True may improve performance, especially on small vocabulary sizes,
+      but will generally require more memory.
   """
-  # This function assumes that the input is of shape [batch_size, seq_length,
-  # num_inputs].
-  #
-  # If the input is a 2D tensor of shape [batch_size, seq_length], we
-  # reshape to [batch_size, seq_length, 1].
-  if input_ids.shape.ndims == 2:
-    input_ids = tf.expand_dims(input_ids, axis=[-1])
 
-  embedding_table = tf.get_variable(
-      name=word_embedding_name,
-      shape=[vocab_size, embedding_size],
-      initializer=create_initializer(initializer_range))
+  def __init__(self,
+               vocab_size,
+               embedding_width,
+               initializer="glorot_uniform",
+               use_one_hot=False,
+               **kwargs):
 
-  flat_input_ids = tf.reshape(input_ids, [-1])
-  if use_one_hot_embeddings:
-    one_hot_input_ids = tf.one_hot(flat_input_ids, depth=vocab_size)
-    output = tf.matmul(one_hot_input_ids, embedding_table)
-  else:
-    output = tf.gather(embedding_table, flat_input_ids)
+    super(OnDeviceEmbedding, self).__init__(**kwargs)
+    self._vocab_size = vocab_size
+    self._embedding_width = embedding_width
+    self._initializer = initializer
+    self._use_one_hot = use_one_hot
 
-  input_shape = get_shape_list(input_ids)
+  def get_config(self):
+    config = {
+        "vocab_size": self._vocab_size,
+        "embedding_width": self._embedding_width,
+        "initializer": self._initializer,
+        "use_one_hot": self._use_one_hot,
+    }
+    base_config = super(OnDeviceEmbedding, self).get_config()
+    return dict(list(base_config.items()) + list(config.items()))
 
-  output = tf.reshape(output,
-                      input_shape[0:-1] + [input_shape[-1] * embedding_size])
-  return (output, embedding_table)
+  def build(self, input_shape):
+    self.embeddings = self.add_weight(
+        "embeddings",
+        shape=[self._vocab_size, self._embedding_width],
+        initializer=self._initializer)
 
+    super(OnDeviceEmbedding, self).build(input_shape)
 
-def embedding_postprocessor(input_tensor,
-                            use_token_type=False,
-                            token_type_ids=None,
-                            token_type_vocab_size=16,
-                            token_type_embedding_name="token_type_embeddings",
-                            use_position_embeddings=True,
-                            position_embedding_name="position_embeddings",
-                            initializer_range=0.02,
-                            max_position_embeddings=512,
-                            dropout_prob=0.1):
-  """Performs various post-processing on a word embedding tensor.
+  def call(self, inputs):
+    input_shape = get_shape_list(inputs, expected_rank=2)
+    input_shape.append(self._embedding_width)
+    flat_inputs = tf.reshape(inputs, [-1])
+    if self._use_one_hot:
+      one_hot_data = tf.one_hot(
+          flat_inputs, depth=self._vocab_size,
+          dtype=self.compute_dtype)
+      embeddings = tf.matmul(one_hot_data, self.embeddings)
+    else:
+      embeddings = tf.gather(self.embeddings, flat_inputs)
+    embeddings = tf.reshape(embeddings, input_shape)
 
-  Args:
-    input_tensor: float Tensor of shape [batch_size, seq_length,
-      embedding_size].
-    use_token_type: bool. Whether to add embeddings for `token_type_ids`.
-    token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
-      Must be specified if `use_token_type` is True.
-    token_type_vocab_size: int. The vocabulary size of `token_type_ids`.
-    token_type_embedding_name: string. The name of the embedding table variable
-      for token type ids.
-    use_position_embeddings: bool. Whether to add position embeddings for the
-      position of each token in the sequence.
-    position_embedding_name: string. The name of the embedding table variable
-      for positional embeddings.
-    initializer_range: float. Range of the weight initialization.
-    max_position_embeddings: int. Maximum sequence length that might ever be
-      used with this model. This can be longer than the sequence length of
-      input_tensor, but cannot be shorter.
-    dropout_prob: float. Dropout probability applied to the final output tensor.
+    return embeddings
 
-  Returns:
-    float tensor with same shape as `input_tensor`.
+@tf.keras.utils.register_keras_serializable(package="Text")
+class PositionEmbedding(tf.keras.layers.Layer):
+  """Creates a positional embedding.
 
-  Raises:
-    ValueError: One of the tensor shapes or input values is invalid.
+  This layer creates a positional embedding as described in "BERT: Pre-training
+  of Deep Bidirectional Transformers for Language Understanding"
+  (https://arxiv.org/abs/1810.04805).
+
+  This layer can be set up to either create a statically shaped slice or a
+  dynamically shaped slice. If `use_dynamic_slicing` is True, the input tensor
+  can have a dynamic 1st dimension, while if `use_dynamic_slicing` is False the
+  input size must be fixed.
+
+  Attributes:
+    use_dynamic_slicing: Whether to use the dynamic slicing path.
+    max_sequence_length: The maximum size of the dynamic sequence. Only
+      applicable if `use_dynamic_slicing` is True.
+    initializer: The initializer to use for the embedding weights. Defaults to
+      "glorot_uniform".
   """
-  input_shape = get_shape_list(input_tensor, expected_rank=3)
-  batch_size = input_shape[0]
-  seq_length = input_shape[1]
-  width = input_shape[2]
 
-  output = input_tensor
+  def __init__(self,
+               initializer="glorot_uniform",
+               use_dynamic_slicing=False,
+               max_sequence_length=None,
+               **kwargs):
+    # We need to have a default dtype of float32, since the inputs (which Keras
+    # usually uses to infer the dtype) will always be int32.
+    if "dtype" not in kwargs:
+      kwargs["dtype"] = "float32"
 
-  if use_token_type:
-    if token_type_ids is None:
-      raise ValueError("`token_type_ids` must be specified if"
-                       "`use_token_type` is True.")
-    token_type_table = tf.get_variable(
-        name=token_type_embedding_name,
-        shape=[token_type_vocab_size, width],
-        initializer=create_initializer(initializer_range))
-    # This vocab will be small so we always do one-hot here, since it is always
-    # faster for a small vocabulary.
-    flat_token_type_ids = tf.reshape(token_type_ids, [-1])
-    one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size)
-    token_type_embeddings = tf.matmul(one_hot_ids, token_type_table)
-    token_type_embeddings = tf.reshape(token_type_embeddings,
-                                       [batch_size, seq_length, width])
-    output += token_type_embeddings
+    super(PositionEmbedding, self).__init__(**kwargs)
+    if use_dynamic_slicing and max_sequence_length is None:
+      raise ValueError(
+          "If `use_dynamic_slicing` is True, `max_sequence_length` must be set."
+      )
+    self._max_sequence_length = max_sequence_length
+    self._initializer = tf.keras.initializers.get(initializer)
+    self._use_dynamic_slicing = use_dynamic_slicing
 
-  if use_position_embeddings:
-    assert_op = tf.assert_less_equal(seq_length, max_position_embeddings)
-    with tf.control_dependencies([assert_op]):
-      full_position_embeddings = tf.get_variable(
-          name=position_embedding_name,
-          shape=[max_position_embeddings, width],
-          initializer=create_initializer(initializer_range))
+  def get_config(self):
+    config = {
+        "max_sequence_length": self._max_sequence_length,
+        "initializer": tf.keras.initializers.serialize(self._initializer),
+        "use_dynamic_slicing": self._use_dynamic_slicing,
+    }
+    base_config = super(PositionEmbedding, self).get_config()
+    return dict(list(base_config.items()) + list(config.items()))
+
+  def build(self, input_shape):
+    """Implements build() for the layer."""
+    dimension_list = input_shape.as_list()
+
+    if len(dimension_list) != 3:
+      raise ValueError("PositionEmbedding expects a 3-dimensional input tensor "
+                       "of shape [batch, sequence, width]")
+    seq_length = dimension_list[1]
+    width = dimension_list[2]
+
+    # If we are not using dynamic slicing, we must assume that the sequence
+    # length is fixed and max_sequence_length should not be specified.
+    if not self._use_dynamic_slicing:
+      if seq_length is None:
+        raise ValueError(
+            "PositionEmbedding must have `use_dynamic_slicing` set "
+            "to True (and max_sequence_length set) when the "
+            "sequence (1st) dimension of the input is None.")
+      if self._max_sequence_length is not None:
+        raise ValueError(
+            "When `use_dynamic_slicing` is False, max_sequence_length should "
+            "not be specified and we ought to use seq_length to get the "
+            "variable shape.")
+
+    if self._max_sequence_length is not None:
+      weight_sequence_length = self._max_sequence_length
+    else:
+      weight_sequence_length = seq_length
+
+    self._position_embeddings = self.add_weight(
+        "embeddings",
+        shape=[weight_sequence_length, width],
+        initializer=self._initializer)
+
+    super(PositionEmbedding, self).build(input_shape)
+
+  def call(self, inputs):
+    """Implements call() for the layer."""
+    if self._use_dynamic_slicing:
+      input_shape = get_shape_list(inputs, expected_rank=3)
+      seq_length = input_shape[1]
+      width = input_shape[2]
+
+      position_embeddings = tf.expand_dims(
+          tf.slice(self._position_embeddings, [0, 0], [seq_length, width]),
+          axis=0)
+    else:
+      position_embeddings = tf.expand_dims(self._position_embeddings, axis=0)
+
+    return position_embeddings
+
+@tf.keras.utils.register_keras_serializable(package="Text")
+class EmbeddingLayer(tf.keras.layers.Layer):
+  def __init__(self,
+    vocab_size,
+    embedding_size=128,
+    initializer_range=0.02,
+    word_embedding_name="word_embeddings",
+    use_one_hot_embeddings=False,
+    **kwargs):
+    """Looks up words embeddings for id tensor.
+
+    Args:
+      input_ids: int32 Tensor of shape [batch_size, seq_length] containing word
+        ids.
+      vocab_size: int. Size of the embedding vocabulary.
+      embedding_size: int. Width of the word embeddings.
+      initializer_range: float. Embedding initialization range.
+      word_embedding_name: string. Name of the embedding table.
+      use_one_hot_embeddings: bool. If True, use one-hot method for word
+        embeddings. If False, use `tf.gather()`.
+
+    Returns:
+      float Tensor of shape [batch_size, seq_length, embedding_size].
+    """
+    super(EmbeddingLayer, self).__init__(**kwargs)
+    self.vocab_size = vocab_size
+    self.embedding_size = embedding_size
+    self.initializer_range = initializer_range
+    self.word_embedding_name = word_embedding_name
+    self.use_one_hot_embeddings = use_one_hot_embeddings
+
+  def get_config(self):
+    config = {
+        "vocab_size": self.vocab_size,
+        "embedding_size": self.embedding_size,
+        "initializer_range": self.initializer_range,
+        "use_one_hot_embeddings": self.use_one_hot_embeddings,
+        "word_embedding_name": self.word_embedding_name
+    }
+    base_config = super(EmbeddingLayer, self).get_config()
+    return dict(list(base_config.items()) + list(config.items()))
+  
+  def build(self, input_shape):
+    self.embedding_table = self.add_weight(
+        name=self.word_embedding_name,
+        shape=[self.vocab_size, self.embedding_size],
+        initializer=create_initializer(self.initializer_range))
+    super(EmbeddingLayer, self).build(input_shape)
+
+  def call(self, input_ids):
+    # This function assumes that the input is of shape [batch_size, seq_length,
+    # num_inputs].
+    #
+    # If the input is a 2D tensor of shape [batch_size, seq_length], we
+    # reshape to [batch_size, seq_length, 1].
+    if input_ids.shape.ndims == 2:
+      input_ids = tf.expand_dims(input_ids, axis=[-1])
+
+    flat_input_ids = tf.reshape(input_ids, [-1])
+    if self.use_one_hot_embeddings:
+      one_hot_input_ids = tf.one_hot(flat_input_ids, depth=self.vocab_size)
+      output = tf.matmul(one_hot_input_ids, self.embedding_table)
+    else:
+      output = tf.gather(self.embedding_table, flat_input_ids)
+
+    input_shape = get_shape_list(input_ids)
+
+    output = tf.reshape(output,
+                        input_shape[0:-1] + [input_shape[-1] * self.embedding_size])
+    return (output, self.embedding_table)
+
+@tf.keras.utils.register_keras_serializable(package="Text")
+class EmbeddingPostprocessor(tf.keras.layers.Layer):
+  def __init__(self, 
+    use_token_type=False,
+    token_type_ids=None,
+    token_type_vocab_size=16,
+    token_type_embedding_name="token_type_embeddings",
+    use_position_embeddings=True,
+    position_embedding_name="position_embeddings",
+    initializer_range=0.02,
+    max_position_embeddings=512,
+    dropout_prob=0.1,
+    **kwargs):
+    """Performs various post-processing on a word embedding tensor.
+
+    Args:
+      input_tensor: float Tensor of shape [batch_size, seq_length,
+        embedding_size].
+      use_token_type: bool. Whether to add embeddings for `token_type_ids`.
+      token_type_ids: (optional) int32 Tensor of shape [batch_size, seq_length].
+        Must be specified if `use_token_type` is True.
+      token_type_vocab_size: int. The vocabulary size of `token_type_ids`.
+      token_type_embedding_name: string. The name of the embedding table variable
+        for token type ids.
+      use_position_embeddings: bool. Whether to add position embeddings for the
+        position of each token in the sequence.
+      position_embedding_name: string. The name of the embedding table variable
+        for positional embeddings.
+      initializer_range: float. Range of the weight initialization.
+      max_position_embeddings: int. Maximum sequence length that might ever be
+        used with this model. This can be longer than the sequence length of
+        input_tensor, but cannot be shorter.
+      dropout_prob: float. Dropout probability applied to the final output tensor.
+
+    Returns:
+      float tensor with same shape as `input_tensor`.
+
+    Raises:
+      ValueError: One of the tensor shapes or input values is invalid.
+    """
+    super(EmbeddingPostprocessor, self).__init__(**kwargs)
+    self.use_token_type = use_token_type
+    self.token_type_ids = token_type_ids
+    self.token_type_vocab_size = token_type_vocab_size
+    self.token_type_embedding_name = token_type_embedding_name
+    self.use_position_embeddings = use_position_embeddings
+    self.position_embedding_name = position_embedding_name
+    self.initializer_range = initializer_range
+    self.max_position_embeddings = max_position_embeddings
+    self.dropout_prob = dropout_prob
+  
+  def get_config(self):
+    config = {
+      "use_token_type": self.use_token_type,
+      "token_type_ids": self.token_type_ids,
+      "token_type_vocab_size": self.token_type_vocab_size,
+      "token_type_embedding_name": self.token_type_embedding_name,
+      "use_position_embeddings": self.use_position_embeddings,
+      "position_embedding_name": self.position_embedding_name,
+      "initializer_range": self.initializer_range,
+      "max_position_embeddings": self.max_position_embeddings,
+      "dropout_prob": self.dropout_prob,
+    }
+    base_config = super(EmbeddingPostprocessor, self).get_config()
+    return dict(list(base_config.items()) + list(config.items()))
+  
+  def build(self, input_shape):
+    dimension_list = input_shape.as_list()
+    width = dimension_list[2]
+    if self.use_token_type:
+      self.token_type_table = self.add_weight(
+          name=self.token_type_embedding_name,
+          shape=[self.token_type_vocab_size, width],
+          initializer=create_initializer(self.initializer_range))
+
+    if self.use_position_embeddings:
+      self.full_position_embeddings = self.add_weight(
+            name=self.position_embedding_name,
+            shape=[self.max_position_embeddings, width],
+            initializer=create_initializer(self.initializer_range))
+
+    super(EmbeddingPostprocessor, self).build(input_shape)
+
+  def call(self, input_tensor):
+    
+    input_shape = get_shape_list(input_tensor, expected_rank=3)
+    
+    batch_size = input_shape[0]
+    seq_length = input_shape[1]
+    width = input_shape[2]
+
+    output = input_tensor
+    token_type_embeddings, position_embeddings = None, None
+
+    if self.use_token_type:
+      if self.token_type_ids is None:
+        raise ValueError("`token_type_ids` must be specified if"
+                        "`use_token_type` is True.")
+      
+      # This vocab will be small so we always do one-hot here, since it is always
+      # faster for a small vocabulary.
+      flat_token_type_ids = tf.reshape(self.token_type_ids, [-1])
+      one_hot_ids = tf.one_hot(flat_token_type_ids, depth=self.token_type_vocab_size, dtype=self.compute_dtype)
+      token_type_embeddings = tf.matmul(one_hot_ids, self.token_type_table)
+      token_type_embeddings = tf.reshape(token_type_embeddings,
+                                        input_shape)
+      # token_type_embeddings = tf.reshape(token_type_embeddings,
+      #                                   [-1, seq_length, width])
+
+      # print("word_embeddings: {}".format(input_tensor.shape))
+      # print("token_type_ids: {}, flat_token_type_ids: {}, one_hot_ids: {}({})".format(
+      #   self.token_type_ids.shape, 
+      #   flat_token_type_ids.shape,
+      #   one_hot_ids.shape, self.token_type_vocab_size))
+      # print("token_type_table: {}".format(self.token_type_table.shape))
+      # print("token_type_embeddings: {}".format(token_type_embeddings.shape))
+      # # token_type_embeddings
+      # # output = tf.keras.layers.Add()([output, tf.ones_like(output)])
+
+    if self.use_position_embeddings:
+      # assert_op = tf.compat.v1.assert_less_equal(seq_length, self.max_position_embeddings)
+      # with tf.control_dependencies([assert_op]):
+        
       # Since the position embedding table is a learned variable, we create it
       # using a (long) sequence length `max_position_embeddings`. The actual
       # sequence length might be shorter than this, for faster training of
@@ -502,8 +792,8 @@ def embedding_postprocessor(input_tensor,
       # for position [0, 1, 2, ..., max_position_embeddings-1], and the current
       # sequence has positions [0, 1, 2, ... seq_length-1], so we can just
       # perform a slice.
-      position_embeddings = tf.slice(full_position_embeddings, [0, 0],
-                                     [seq_length, -1])
+      position_embeddings = tf.slice(self.full_position_embeddings, [0, 0],
+                                    [seq_length, -1])
       num_dims = len(output.shape.as_list())
 
       # Only the last two dimensions are relevant (`seq_length` and `width`), so
@@ -514,11 +804,10 @@ def embedding_postprocessor(input_tensor,
         position_broadcast_shape.append(1)
       position_broadcast_shape.extend([seq_length, width])
       position_embeddings = tf.reshape(position_embeddings,
-                                       position_broadcast_shape)
-      output += position_embeddings
+                                      position_broadcast_shape)
+      print("HHH")
 
-  output = layer_norm_and_dropout(output, dropout_prob)
-  return output
+    return token_type_embeddings, position_embeddings
 
 
 def create_attention_mask_from_input_mask(from_tensor, to_mask):
@@ -568,7 +857,8 @@ def attention_layer(from_tensor,
                     do_return_2d_tensor=False,
                     batch_size=None,
                     from_seq_length=None,
-                    to_seq_length=None):
+                    to_seq_length=None,
+                    name=None):
   """Performs multi-headed attention from `from_tensor` to `to_tensor`.
 
   This is an implementation of multi-headed attention based on "Attention
@@ -634,6 +924,7 @@ def attention_layer(from_tensor,
     output_tensor = tf.transpose(output_tensor, [0, 2, 1, 3])
     return output_tensor
 
+  name = "" if name is None else name + "/"
   from_shape = get_shape_list(from_tensor, expected_rank=[2, 3])
   to_shape = get_shape_list(to_tensor, expected_rank=[2, 3])
 
@@ -663,28 +954,25 @@ def attention_layer(from_tensor,
   to_tensor_2d = reshape_to_matrix(to_tensor)
 
   # `query_layer` = [B*F, N*H]
-  query_layer = tf.layers.dense(
-      from_tensor_2d,
-      num_attention_heads * size_per_head,
+  query_layer = tf.keras.layers.Dense(
+      name=name+"query",
+      units=num_attention_heads * size_per_head,
       activation=query_act,
-      name="query",
-      kernel_initializer=create_initializer(initializer_range))
+      kernel_initializer=create_initializer(initializer_range))(from_tensor_2d)
 
   # `key_layer` = [B*T, N*H]
-  key_layer = tf.layers.dense(
-      to_tensor_2d,
-      num_attention_heads * size_per_head,
+  key_layer = tf.keras.layers.Dense(
+      name=name+"key",
+      units=num_attention_heads * size_per_head,
       activation=key_act,
-      name="key",
-      kernel_initializer=create_initializer(initializer_range))
+      kernel_initializer=create_initializer(initializer_range))(to_tensor_2d)
 
   # `value_layer` = [B*T, N*H]
-  value_layer = tf.layers.dense(
-      to_tensor_2d,
-      num_attention_heads * size_per_head,
+  value_layer = tf.keras.layers.Dense(
+      name=name+"value",
+      units=num_attention_heads * size_per_head,
       activation=value_act,
-      name="value",
-      kernel_initializer=create_initializer(initializer_range))
+      kernel_initializer=create_initializer(initializer_range))(to_tensor_2d)
 
   # `query_layer` = [B, N, F, H]
   query_layer = transpose_for_scores(query_layer, batch_size,
@@ -713,7 +1001,7 @@ def attention_layer(from_tensor,
 
     # Since we are adding it to the raw scores before the softmax, this is
     # effectively the same as removing these entirely.
-    attention_scores += adder
+    attention_scores = tf.keras.layers.Add()([attention_scores, adder])
 
   # Normalize the attention scores to probabilities.
   # `attention_probs` = [B, N, F, T]
@@ -721,7 +1009,7 @@ def attention_layer(from_tensor,
 
   # This is actually dropping out entire tokens to attend to, which might
   # seem a bit unusual, but is taken from the original Transformer paper.
-  attention_probs = dropout(attention_probs, attention_probs_dropout_prob)
+  attention_probs = dropout(attention_probs, attention_probs_dropout_prob, name=name)
 
   # `value_layer` = [B, T, N, H]
   value_layer = tf.reshape(
@@ -824,25 +1112,24 @@ def transformer_model(input_tensor,
 
   all_layer_outputs = []
   for layer_idx in range(num_hidden_layers):
-    with tf.variable_scope("layer_%d" % layer_idx):
+    with tf_variable_scope("layer_%d" % layer_idx):
       layer_input = prev_output
-
-      with tf.variable_scope("attention"):
+      with tf_variable_scope("attention"):
         attention_heads = []
-        with tf.variable_scope("self"):
-          attention_head = attention_layer(
-              from_tensor=layer_input,
-              to_tensor=layer_input,
-              attention_mask=attention_mask,
-              num_attention_heads=num_attention_heads,
-              size_per_head=attention_head_size,
-              attention_probs_dropout_prob=attention_probs_dropout_prob,
-              initializer_range=initializer_range,
-              do_return_2d_tensor=True,
-              batch_size=batch_size,
-              from_seq_length=seq_length,
-              to_seq_length=seq_length)
-          attention_heads.append(attention_head)
+        attention_head = attention_layer(
+            from_tensor=layer_input,
+            to_tensor=layer_input,
+            attention_mask=attention_mask,
+            num_attention_heads=num_attention_heads,
+            size_per_head=attention_head_size,
+            attention_probs_dropout_prob=attention_probs_dropout_prob,
+            initializer_range=initializer_range,
+            do_return_2d_tensor=True,
+            batch_size=batch_size,
+            from_seq_length=seq_length,
+            to_seq_length=seq_length,
+            name="layer_{}/attention/self".format(layer_idx))
+        attention_heads.append(attention_head)
 
         attention_output = None
         if len(attention_heads) == 1:
@@ -854,32 +1141,29 @@ def transformer_model(input_tensor,
 
         # Run a linear projection of `hidden_size` then add a residual
         # with `layer_input`.
-        with tf.variable_scope("output"):
-          attention_output = tf.layers.dense(
-              attention_output,
-              hidden_size,
-              kernel_initializer=create_initializer(initializer_range))
-          attention_output = dropout(attention_output, hidden_dropout_prob)
-          attention_output = layer_norm(attention_output + layer_input)
+        attention_output = tf.keras.layers.Dense(
+            name="layer_{}/attention/output/dense".format(layer_idx),
+            units=hidden_size,
+            kernel_initializer=create_initializer(initializer_range))(attention_output)
+        attention_output = dropout(attention_output, hidden_dropout_prob, name="layer_{}/attention/output/dropout".format(layer_idx))
+        attention_output = layer_norm(tf.keras.layers.Add()([attention_output, layer_input]), name="layer_{}/attention/output/norm".format(layer_idx))
 
       # The activation is only applied to the "intermediate" hidden layer.
-      with tf.variable_scope("intermediate"):
-        intermediate_output = tf.layers.dense(
-            attention_output,
-            intermediate_size,
+      with tf_variable_scope("intermediate"):
+        intermediate_output = tf.keras.layers.Dense(
+            units=intermediate_size,
             activation=intermediate_act_fn,
-            kernel_initializer=create_initializer(initializer_range))
+            kernel_initializer=create_initializer(initializer_range))(attention_output)
 
       # Down-project back to `hidden_size` then add the residual.
-      with tf.variable_scope("output"):
-        layer_output = tf.layers.dense(
-            intermediate_output,
-            hidden_size,
-            kernel_initializer=create_initializer(initializer_range))
-        layer_output = dropout(layer_output, hidden_dropout_prob)
-        layer_output = layer_norm(layer_output + attention_output)
-        prev_output = layer_output
-        all_layer_outputs.append(layer_output)
+      layer_output = tf.keras.layers.Dense(
+          name="layer_{}/output/dense".format(layer_idx),
+          units=hidden_size,
+          kernel_initializer=create_initializer(initializer_range))(intermediate_output)
+      layer_output = dropout(layer_output, hidden_dropout_prob, name="layer_{}/output/dropout".format(layer_idx))
+      layer_output = layer_norm(tf.keras.layers.Add()([layer_output, attention_output]), name="layer_{}/output/norm".format(layer_idx))
+      prev_output = layer_output
+      all_layer_outputs.append(layer_output)
 
   if do_return_all_layers:
     final_outputs = []
@@ -979,7 +1263,10 @@ def assert_rank(tensor, expected_rank, name=None):
 
   actual_rank = tensor.shape.ndims
   if actual_rank not in expected_rank_dict:
-    scope_name = tf.get_variable_scope().name
+    try:
+      scope_name = tf.get_variable_scope().name
+    except AttributeError:
+      scope_name = tf.compat.v1.get_variable_scope().name
     raise ValueError(
         "For the tensor `%s` in scope `%s`, the actual rank "
         "`%d` (shape = %s) is not equal to the expected rank `%s`" %

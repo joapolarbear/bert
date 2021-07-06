@@ -30,181 +30,279 @@ except:
 from google.protobuf.json_format import MessageToJson
 from google.protobuf.json_format import Parse as parse_protobuf_json
 
+try:
+  tf_get_variable = tf.get_variable
+except AttributeError:
+  tf_get_variable = tf.compat.v1.get_variable
+
 if os.environ.get("BPF_ENABLE_RECOMPUTE", "") == '1':
     from horovod.tensorflow import memory_saving_gradients # monkey patch tf.gradients to point to our custom version, with automatic checkpoint selection
     # tf.__dict__["gradients"] = memory_saving_gradients.gradients_speed
     tf.__dict__["gradients"] = memory_saving_gradients.gradients_memory
     print("================= Enable Re-computation =================")
 
-def dump_computation_graph(trace_dir):
-    graphdef = tf.compat.v1.get_default_graph().as_graph_def()
-    graph_str = json.loads(MessageToJson(graphdef))
-    if not os.path.isdir(trace_dir):
-      os.makedirs(trace_dir)
-    with open(os.path.join(trace_dir, "graph.json"), "w") as f:
-        json.dump(graph_str, f, indent=4)
+# def dump_computation_graph(trace_dir):
+#     graphdef = tf.compat.v1.get_default_graph().as_graph_def()
+#     graph_str = json.loads(MessageToJson(graphdef))
+#     if not os.path.isdir(trace_dir):
+#       os.makedirs(trace_dir)
+#     with open(os.path.join(trace_dir, "graph.json"), "w") as f:
+#         json.dump(graph_str, f, indent=4)
 
+class WarmUp(tf.keras.optimizers.schedules.LearningRateSchedule):
+  """Applies a warmup schedule on a given learning rate decay schedule."""
 
-def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu, use_amp=False):
-  """Creates an optimizer training op."""
-  global_step = tf.train.get_or_create_global_step()
-
-  learning_rate = tf.constant(value=init_lr, shape=[], dtype=tf.float32)
-
-  # Implements linear decay of the learning rate.
-  learning_rate = tf.train.polynomial_decay(
-      learning_rate,
-      global_step,
-      num_train_steps,
-      end_learning_rate=0.0,
+  def __init__(
+      self,
+      initial_learning_rate,
+      decay_schedule_fn,
+      warmup_steps,
+      start_warmup_step=0,
       power=1.0,
-      cycle=False)
+      name=None):
+    super(WarmUp, self).__init__()
+    self.initial_learning_rate = initial_learning_rate
+    self.warmup_steps = warmup_steps
+    self.power = power
+    self.decay_schedule_fn = decay_schedule_fn
+    self.name = name
+    self.start_warmup_step = start_warmup_step
 
-  # Implements linear warmup. I.e., if global_step < num_warmup_steps, the
-  # learning rate will be `global_step/num_warmup_steps * init_lr`.
+  def __call__(self, step):
+    with tf.name_scope(self.name or 'WarmUp') as name:
+      # Implements polynomial warmup. i.e.,
+      # if global_step - start_warmup_step < warmup_steps, the learning rate
+      # will be `(global_step - start_warmup_step)/num_warmup_steps * init_lr`.
+      step_int = tf.cast(step, tf.int32)
+      start_warmup_int = tf.constant(self.start_warmup_step, tf.int32)
+      global_step_float = tf.cast(step_int - start_warmup_int, tf.float32)
+      warmup_steps_float = tf.cast(self.warmup_steps, tf.float32)
+      warmup_percent_done = global_step_float / warmup_steps_float
+      warmup_learning_rate = (
+          self.initial_learning_rate *
+          tf.math.pow(warmup_percent_done, self.power))
+      return tf.cond(global_step_float < warmup_steps_float,
+                     lambda: warmup_learning_rate,
+                     lambda: self.decay_schedule_fn(step),
+                     name=name)
+
+  def get_config(self):
+    return {
+        'initial_learning_rate': self.initial_learning_rate,
+        'decay_schedule_fn': self.decay_schedule_fn,
+        'warmup_steps': self.warmup_steps,
+        'power': self.power,
+        'name': self.name
+    }
+
+
+def create_optimizer(
+  init_lr, num_train_steps, num_warmup_steps, use_amp=False,
+  optimizer_type='adamw',
+  poly_power=1.0,
+  start_warmup_step=0,
+  weight_decay_rate=0.01,
+  beta_1=0.9,
+  beta_2=0.999,
+  epsilon=1e-6):
+  """Creates an optimizer with learning rate schedule."""
+  # Implements linear decay of the learning rate.
+  learning_rate_fn = tf.keras.optimizers.schedules.PolynomialDecay(
+      initial_learning_rate=init_lr,
+      decay_steps=num_train_steps,
+      power=poly_power,
+      end_learning_rate=0.0)
   if num_warmup_steps:
-    global_steps_int = tf.cast(global_step, tf.int32)
-    warmup_steps_int = tf.constant(num_warmup_steps, dtype=tf.int32)
+    learning_rate_fn = WarmUp(initial_learning_rate=init_lr,
+                              decay_schedule_fn=learning_rate_fn,
+                              warmup_steps=num_warmup_steps,
+                              start_warmup_step=start_warmup_step)
+  use_experimental_compile = True if tf.config.list_physical_devices(
+  'GPU') else False
 
-    global_steps_float = tf.cast(global_steps_int, tf.float32)
-    warmup_steps_float = tf.cast(warmup_steps_int, tf.float32)
+  use_experimental_compile = False
 
-    warmup_percent_done = global_steps_float / warmup_steps_float
-    warmup_learning_rate = init_lr * warmup_percent_done
+  if optimizer_type == 'adamw':
+    print('using Adamw optimizer')
+    optimizer = AdamWeightDecay(
+        learning_rate=learning_rate_fn,
+        weight_decay_rate=weight_decay_rate,
+        beta_1=beta_1,
+        beta_2=beta_2,
+        epsilon=epsilon,
+        exclude_from_weight_decay=['layer_norm', 'bias'])
+  elif optimizer_type == 'lamb':
+    print('using Lamb optimizer')
+    optimizer = LAMBOptimizer(
+        learning_rate=learning_rate_fn,
+        weight_decay_rate=weight_decay_rate,
+        beta_1=beta_1,
+        beta_2=beta_2,
+        epsilon=epsilon,
+        exclude_from_weight_decay=['LayerNorm', 'layer_norm', 'bias'],
+        use_experimental_compile=use_experimental_compile)
+  else:
+    raise ValueError('Unsupported optimizer type: ', optimizer_type)
 
-    is_warmup = tf.cast(global_steps_int < warmup_steps_int, tf.float32)
-    learning_rate = (
-        (1.0 - is_warmup) * learning_rate + is_warmup * warmup_learning_rate)
-
-  # It is recommended that you use this optimizer for fine tuning, since this
-  # is how the model was trained (note that the Adam m/v variables are NOT
-  # loaded from init_checkpoint.)
-  optimizer = AdamWeightDecayOptimizer(
-      learning_rate=learning_rate,
-      weight_decay_rate=0.01,
-      beta_1=0.9,
-      beta_2=0.999,
-      epsilon=1e-6,
-      exclude_from_weight_decay=["LayerNorm", "layer_norm", "bias"])
-    
   if use_amp:
     # auto mixed precision training
     optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(optimizer)
-  print("=================USING DISTRIBUTED OPTIMIZER=================")
-  optimizer = bps.DistributedOptimizer(optimizer)
-  tvars = tf.trainable_variables()
-  if os.environ.get("BPF_ENABLE_RECOMPUTE", "") == '1':
-    grads = tf.gradients(loss, tvars)
-    tvars = tf.trainable_variables()
-    # print("HHP tf.gradients: {} vars, {}".format(len(tvars), tvars))
-  else:
-    grads_and_vars = optimizer.compute_gradients(loss, tvars)
-    grads = [grad for grad,var in grads_and_vars]
-    tvars = [var for grad,var in grads_and_vars]
-    # print("HHP optimizer.compute_gradients: {} vars, {}".format(len(tvars), tvars))
 
-  # This is how the model was pre-trained.
-  (grads, _) = tf.clip_by_global_norm(grads, clip_norm=1.0)
+  return optimizer
 
-  trace_dir = os.path.join(os.environ.get("BYTEPS_TRACE_DIR", "."), str(bps.local_rank()))
-  dump_computation_graph(trace_dir)
+# class AdamWeightDecayOptimizer(tf.keras.optimizers.Adam):
+#   """A basic Adam optimizer that includes "correct" L2 weight decay."""
 
-  train_op = optimizer.apply_gradients(
-      zip(grads, tvars), global_step=global_step)
+#   def __init__(self,
+#                learning_rate,
+#                weight_decay_rate=0.0,
+#                beta_1=0.9,
+#                beta_2=0.999,
+#                epsilon=1e-6,
+#                exclude_from_weight_decay=None,
+#                name="AdamWeightDecayOptimizer",
+#                amsgrad=False,
+#                **kwargs):
+#     """Constructs a AdamWeightDecayOptimizer."""
+#     super(AdamWeightDecayOptimizer, self).__init__(learning_rate, beta_1, beta_2, epsilon, amsgrad, name, **kwargs)
 
-  # Normally the global step update is done inside of `apply_gradients`.
-  # However, `AdamWeightDecayOptimizer` doesn't do this. But if you use
-  # a different optimizer, you should probably take this line out.
-  new_global_step = global_step + 1
-  train_op = tf.group(train_op, [global_step.assign(new_global_step)])
-  return train_op
+#     self.weight_decay_rate = weight_decay_rate
+#     self.beta_1 = beta_1
+#     self.beta_2 = beta_2
+#     self.epsilon = epsilon
+#     self.exclude_from_weight_decay = exclude_from_weight_decay
+
+#   def apply_gradients(self, grads_and_vars, name=None, experimental_aggregate_gradients=True):
+#     """See base class."""
+#     return super(AdamWeightDecay, self).apply_gradients(
+#         grads_and_vars,
+#         name=name,
+#         experimental_aggregate_gradients=experimental_aggregate_gradients)
+
+#   def _do_use_weight_decay(self, param_name):
+#     """Whether to use L2 weight decay for `param_name`."""
+#     if not self.weight_decay_rate:
+#       return False
+#     if self.exclude_from_weight_decay:
+#       for r in self.exclude_from_weight_decay:
+#         if re.search(r, param_name) is not None:
+#           return False
+#     return True
+
+#   def _get_variable_name(self, param_name):
+#     """Get the variable name from the tensor name."""
+#     m = re.match("^(.*):\\d+$", param_name)
+#     if m is not None:
+#       param_name = m.group(1)
+#     return param_name
 
 
-class AdamWeightDecayOptimizer(tf.train.Optimizer):
-  """A basic Adam optimizer that includes "correct" L2 weight decay."""
+class AdamWeightDecay(tf.keras.optimizers.Adam):
+  """Adam enables L2 weight decay and clip_by_global_norm on gradients.
+
+  Just adding the square of the weights to the loss function is *not* the
+  correct way of using L2 regularization/weight decay with Adam, since that will
+  interact with the m and v parameters in strange ways.
+
+  Instead we want ot decay the weights in a manner that doesn't interact with
+  the m/v parameters. This is equivalent to adding the square of the weights to
+  the loss with plain (non-momentum) SGD.
+  """
 
   def __init__(self,
-               learning_rate,
-               weight_decay_rate=0.0,
+               learning_rate=0.001,
                beta_1=0.9,
                beta_2=0.999,
-               epsilon=1e-6,
+               epsilon=1e-7,
+               amsgrad=False,
+               weight_decay_rate=0.0,
+               include_in_weight_decay=None,
                exclude_from_weight_decay=None,
-               name="AdamWeightDecayOptimizer"):
-    """Constructs a AdamWeightDecayOptimizer."""
-    super(AdamWeightDecayOptimizer, self).__init__(False, name)
-
-    self.learning_rate = learning_rate
+               name='AdamWeightDecay',
+               **kwargs):
+    super(AdamWeightDecay, self).__init__(
+        learning_rate, beta_1, beta_2, epsilon, amsgrad, name, **kwargs)
     self.weight_decay_rate = weight_decay_rate
-    self.beta_1 = beta_1
-    self.beta_2 = beta_2
-    self.epsilon = epsilon
-    self.exclude_from_weight_decay = exclude_from_weight_decay
+    self._include_in_weight_decay = include_in_weight_decay
+    self._exclude_from_weight_decay = exclude_from_weight_decay
 
-  def apply_gradients(self, grads_and_vars, global_step=None, name=None):
-    """See base class."""
-    assignments = []
-    for (grad, param) in grads_and_vars:
-      if grad is None or param is None:
-        continue
+  @classmethod
+  def from_config(cls, config):
+    """Creates an optimizer from its config with WarmUp custom object."""
+    custom_objects = {'WarmUp': WarmUp}
+    return super(AdamWeightDecay, cls).from_config(
+        config, custom_objects=custom_objects)
 
-      param_name = self._get_variable_name(param.name)
+  def _prepare_local(self, var_device, var_dtype, apply_state):
+    super(AdamWeightDecay, self)._prepare_local(var_device, var_dtype,
+                                                apply_state)
+    apply_state[(var_device, var_dtype)]['weight_decay_rate'] = tf.constant(
+        self.weight_decay_rate, name='adam_weight_decay_rate')
 
-      m = tf.get_variable(
-          name=param_name + "/adam_m",
-          shape=param.shape.as_list(),
-          dtype=tf.float32,
-          trainable=False,
-          initializer=tf.zeros_initializer())
-      v = tf.get_variable(
-          name=param_name + "/adam_v",
-          shape=param.shape.as_list(),
-          dtype=tf.float32,
-          trainable=False,
-          initializer=tf.zeros_initializer())
+  def _decay_weights_op(self, var, learning_rate, apply_state):
+    do_decay = self._do_use_weight_decay(var.name)
+    if do_decay:
+      return var.assign_sub(
+          learning_rate * var *
+          apply_state[(var.device, var.dtype.base_dtype)]['weight_decay_rate'],
+          use_locking=self._use_locking)
+    return tf.no_op()
 
-      # Standard Adam update.
-      next_m = (
-          tf.multiply(self.beta_1, m) + tf.multiply(1.0 - self.beta_1, grad))
-      next_v = (
-          tf.multiply(self.beta_2, v) + tf.multiply(1.0 - self.beta_2,
-                                                    tf.square(grad)))
+  def apply_gradients(self,
+                      grads_and_vars,
+                      name=None,
+                      experimental_aggregate_gradients=True):
+    return super(AdamWeightDecay, self).apply_gradients(
+        grads_and_vars,
+        name=name,
+        experimental_aggregate_gradients=experimental_aggregate_gradients)
 
-      update = next_m / (tf.sqrt(next_v) + self.epsilon)
+  def _get_lr(self, var_device, var_dtype, apply_state):
+    """Retrieves the learning rate with the given state."""
+    if apply_state is None:
+      return self._decayed_lr_t[var_dtype], {}
 
-      # Just adding the square of the weights to the loss function is *not*
-      # the correct way of using L2 regularization/weight decay with Adam,
-      # since that will interact with the m and v parameters in strange ways.
-      #
-      # Instead we want ot decay the weights in a manner that doesn't interact
-      # with the m/v parameters. This is equivalent to adding the square
-      # of the weights to the loss with plain (non-momentum) SGD.
-      if self._do_use_weight_decay(param_name):
-        update += self.weight_decay_rate * param
+    apply_state = apply_state or {}
+    coefficients = apply_state.get((var_device, var_dtype))
+    if coefficients is None:
+      coefficients = self._fallback_apply_state(var_device, var_dtype)
+      apply_state[(var_device, var_dtype)] = coefficients
 
-      update_with_lr = self.learning_rate * update
+    return coefficients['lr_t'], dict(apply_state=apply_state)
 
-      next_param = param - update_with_lr
+  def _resource_apply_dense(self, grad, var, apply_state=None):
+    lr_t, kwargs = self._get_lr(var.device, var.dtype.base_dtype, apply_state)
+    decay = self._decay_weights_op(var, lr_t, apply_state)
+    with tf.control_dependencies([decay]):
+      return super(AdamWeightDecay, self)._resource_apply_dense(
+          grad, var, **kwargs)
 
-      assignments.extend(
-          [param.assign(next_param),
-           m.assign(next_m),
-           v.assign(next_v)])
-    return tf.group(*assignments, name=name)
+  def _resource_apply_sparse(self, grad, var, indices, apply_state=None):
+    lr_t, kwargs = self._get_lr(var.device, var.dtype.base_dtype, apply_state)
+    decay = self._decay_weights_op(var, lr_t, apply_state)
+    with tf.control_dependencies([decay]):
+      return super(AdamWeightDecay, self)._resource_apply_sparse(
+          grad, var, indices, **kwargs)
+
+  def get_config(self):
+    config = super(AdamWeightDecay, self).get_config()
+    config.update({
+        'weight_decay_rate': self.weight_decay_rate,
+    })
+    return config
 
   def _do_use_weight_decay(self, param_name):
     """Whether to use L2 weight decay for `param_name`."""
-    if not self.weight_decay_rate:
+    if self.weight_decay_rate == 0:
       return False
-    if self.exclude_from_weight_decay:
-      for r in self.exclude_from_weight_decay:
+
+    if self._include_in_weight_decay:
+      for r in self._include_in_weight_decay:
+        if re.search(r, param_name) is not None:
+          return True
+
+    if self._exclude_from_weight_decay:
+      for r in self._exclude_from_weight_decay:
         if re.search(r, param_name) is not None:
           return False
     return True
-
-  def _get_variable_name(self, param_name):
-    """Get the variable name from the tensor name."""
-    m = re.match("^(.*):\\d+$", param_name)
-    if m is not None:
-      param_name = m.group(1)
-    return param_name
